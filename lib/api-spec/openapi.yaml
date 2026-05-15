@@ -1,0 +1,145 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: Ripple media downloader API
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: media
+    description: Media info and download operations
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /media/info:
+    post:
+      operationId: fetchMediaInfo
+      tags: [media]
+      summary: Get media info from URL
+      description: Detects platform and returns available formats for a given URL
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MediaInfoInput"
+      responses:
+        "200":
+          description: Media info retrieved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MediaInfo"
+        "400":
+          description: Invalid URL
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Unsupported platform or unavailable media
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+
+    MediaInfoInput:
+      type: object
+      required:
+        - url
+      properties:
+        url:
+          type: string
+          description: The URL to fetch media info from
+
+    MediaFormat:
+      type: object
+      required:
+        - id
+        - type
+        - label
+      properties:
+        id:
+          type: string
+          description: Format identifier (e.g. itag or format_id)
+        type:
+          type: string
+          enum: [video, audio, image]
+          description: Type of media format
+        label:
+          type: string
+          description: Human-readable label (e.g. "1080p MP4", "Audio MP3")
+        quality:
+          type: ["string", "null"]
+          description: Quality descriptor (e.g. "1080p", "720p", "128kbps")
+        ext:
+          type: ["string", "null"]
+          description: File extension (e.g. "mp4", "mp3", "webm")
+        filesize:
+          type: ["integer", "null"]
+          description: Estimated file size in bytes
+        url:
+          type: ["string", "null"]
+          description: Direct download URL if available
+
+    MediaInfo:
+      type: object
+      required:
+        - title
+        - platform
+        - formats
+      properties:
+        title:
+          type: string
+          description: Title of the media
+        platform:
+          type: string
+          enum: [youtube, tiktok, instagram, twitter, facebook, generic]
+          description: Detected platform
+        thumbnail:
+          type: ["string", "null"]
+          description: Thumbnail URL
+        duration:
+          type: ["integer", "null"]
+          description: Duration in seconds
+        author:
+          type: ["string", "null"]
+          description: Author or channel name
+        formats:
+          type: array
+          items:
+            $ref: "#/components/schemas/MediaFormat"
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
