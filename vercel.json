@@ -1,0 +1,18 @@
+{
+  "installCommand": "pnpm install",
+  "buildCommand": "pnpm --filter @workspace/ripple run build",
+  "outputDirectory": "artifacts/ripple/dist/public",
+  "framework": null,
+  "env": {
+    "PORT": "3000",
+    "BASE_PATH": "/"
+  },
+  "functions": {
+    "api/media/info.ts": {
+      "maxDuration": 30
+    },
+    "api/media/download.ts": {
+      "maxDuration": 60
+    }
+  }
+}
