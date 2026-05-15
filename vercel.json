@@ -1,5 +1,5 @@
 {
-  "installCommand": "pnpm install",
+  "installCommand": "npm install -g pnpm@10.11.0 && pnpm install",
   "buildCommand": "pnpm --filter @workspace/ripple run build",
   "outputDirectory": "artifacts/ripple/dist/public",
   "framework": null,
