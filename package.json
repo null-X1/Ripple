@@ -2,7 +2,7 @@
   "name": "ripple",
   "version": "1.0.0",
   "description": "Ripple — standalone video downloader",
-  "main": "ripple-api.js",
+  "main": "ripple.html",
   "scripts": {
     "start": "node ripple-api.js"
   },
