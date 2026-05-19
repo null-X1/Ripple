@@ -1,35 +1,33 @@
 /**
- * Ripple API Server
+ * Ripple API Server — powered by Cobalt
  * Run: node ripple-api.js
- * Requires: npm install express yt-dlp-exec cors
+ * Requires: npm install express cors
+ * Node >= 18 (uses built-in fetch)
  */
 
 const express = require("express");
 const cors    = require("cors");
 const path    = require("path");
+const https   = require("https");
+const http    = require("http");
 
-// محاولة استدعاء مكتبة yt-dlp الشاملة (تدعم يوتيوب، تيك توك، انستجرام، والمزيد)
-let ytDlp;
-try {
-  ytDlp = require("yt-dlp-exec");
-  if (ytDlp.default) ytDlp = ytDlp.default;
-} catch {
-  console.error("[Ripple] Missing dependency: run  npm install express yt-dlp-exec cors");
-  process.exit(1);
-}
+// ── إعدادات Cobalt ──────────────────────────────────────────────────────────
+// يمكن تغيير هذا إلى instance خاص بك إن أردت
+const COBALT_API = process.env.COBALT_API || "https://api.cobalt.tools";
 
 const PORT = process.env.PORT || 3000;
 const app  = express();
 
 app.use(cors());
 app.use(express.json());
-
-// تشغيل واجهة المستخدم من نفس المسار
 app.use(express.static(path.dirname(__filename)));
 
-// ── دوال المساعدة (Helpers) ──────────────────────────────────────────────────
+// ── دوال المساعدة ────────────────────────────────────────────────────────────
 
-// دالة لتحديد المنصة من الرابط
+function isValidUrl(url) {
+  try { new URL(url); return true; } catch { return false; }
+}
+
 function detectPlatform(url) {
   try {
     const host = new URL(url).hostname.toLowerCase().replace(/^www\./, "");
@@ -38,158 +36,164 @@ function detectPlatform(url) {
     if (host.includes("instagram.com"))                       return "instagram";
     if (host.includes("twitter.com") || host.includes("x.com")) return "twitter";
     if (host.includes("facebook.com") || host === "fb.watch") return "facebook";
+    if (host.includes("twitch.tv"))                           return "twitch";
+    if (host.includes("vimeo.com"))                           return "vimeo";
+    if (host.includes("reddit.com"))                          return "reddit";
+    if (host.includes("soundcloud.com"))                      return "soundcloud";
   } catch {}
   return "generic";
 }
 
-function isValidUrl(url) {
-  try { new URL(url); return true; } catch { return false; }
+/**
+ * يستدعي Cobalt API ويرجع النتيجة
+ * @param {string} url  - رابط الوسائط
+ * @param {object} opts - خيارات Cobalt (videoQuality, audioFormat, downloadMode...)
+ */
+async function callCobalt(url, opts = {}) {
+  const body = JSON.stringify({ url, ...opts });
+
+  const res = await fetch(`${COBALT_API}/`, {
+    method:  "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept":        "application/json",
+    },
+    body,
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Cobalt returned ${res.status}: ${text}`);
+  }
+
+  return res.json();
 }
 
-// الدالة المعدلة لمعالجة الصيغ حسب كل منصة (يوتيوب، تيك توك، انستجرام)
-function buildFormats(info, platform) {
-  const formats = [];
-  // بعض المواقع مثل تيك توك ترجع البيانات مباشرة دون مصفوفة formats
-  const availableFormats = info.formats || (info.url ? [info] : []);
-  if (!availableFormats.length) return formats;
+/**
+ * يبني قائمة الصيغ المتاحة (presets ثابتة) حسب المنصة
+ * كل صيغة تحمل id يُستخدم لاحقاً لاستدعاء Cobalt بالمعاملات الصحيحة
+ */
+function buildPresets(platform) {
+  const isAudioOnly = platform === "soundcloud";
 
-  const seen = new Set();
+  const videoPresets = isAudioOnly ? [] : [
+    { id: "video_max",  type: "video", label: "Video — أفضل جودة",  cobalt: { downloadMode: "auto", videoQuality: "max"  } },
+    { id: "video_1080", type: "video", label: "Video 1080p",         cobalt: { downloadMode: "auto", videoQuality: "1080" } },
+    { id: "video_720",  type: "video", label: "Video 720p",          cobalt: { downloadMode: "auto", videoQuality: "720"  } },
+    { id: "video_480",  type: "video", label: "Video 480p",          cobalt: { downloadMode: "auto", videoQuality: "480"  } },
+    { id: "video_360",  type: "video", label: "Video 360p",          cobalt: { downloadMode: "auto", videoQuality: "360"  } },
+  ];
 
-  // ── الفيديو مع الصوت (Combined) ──────────────────────────────────────────
-  const videoFmts = availableFormats
-    .filter(f => {
-      const isVideo = f.ext === "mp4" || f.ext === "webm" || f.ext === "mov";
-      if (!isVideo) return false;
+  const audioPresets = [
+    { id: "audio_best", type: "audio", label: "Audio — أفضل جودة",  cobalt: { downloadMode: "audio", audioFormat: "best" } },
+    { id: "audio_mp3",  type: "audio", label: "Audio MP3",           cobalt: { downloadMode: "audio", audioFormat: "mp3"  } },
+    { id: "audio_opus", type: "audio", label: "Audio Opus",          cobalt: { downloadMode: "audio", audioFormat: "opus" } },
+    { id: "audio_wav",  type: "audio", label: "Audio WAV",           cobalt: { downloadMode: "audio", audioFormat: "wav"  } },
+  ];
 
-      // منطق خاص لتيك توك وإنستجرام (نتساهل في التحقق من وجود مسار صوتي منفصل)
-      if (platform === "tiktok" || platform === "instagram") {
-        return f.vcodec !== "none" || f.format_note === "watermarked" || f.format_note === "direct video";
-      }
+  // تيك توك: نضيف خيار بدون علامة مائية
+  const tiktokExtra = platform === "tiktok" ? [
+    { id: "video_nowm", type: "video", label: "Video بدون علامة مائية", cobalt: { downloadMode: "auto", videoQuality: "max", tiktokH265: false } },
+  ] : [];
 
-      // منطق يوتيوب (يجب التأكد من دمج الصوت والصورة)
-      return f.vcodec && f.vcodec !== "none" &&
-             f.acodec && f.acodec !== "none" &&
-             f.height;
-    })
-    .sort((a, b) => (b.height || 0) - (a.height || 0));
-
-  for (const f of videoFmts) {
-    const quality = f.height ? `${f.height}p` : f.format_note || f.resolution || "video";
-    const key     = `video-${quality}-${f.ext}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      formats.push({
-        id:       f.format_id || "best", // استخدام best كبديل إذا لم يتوفر ID
-        type:     "video",
-        label:    `Video ${quality} ${(f.ext || "").toUpperCase()}`.trim(),
-        quality,
-        ext:      f.ext || null,
-        filesize: f.filesize || f.filesize_approx || null,
-        url:      null, // التحميل يتم عبر السيرفر لتخطي حظر CORS
-      });
-    }
-  }
-
-  // ── الصوت فقط (Audio-only) ───────────────────────────────────────────────
-  const audioFmts = availableFormats
-    .filter(f =>
-      f.acodec && f.acodec !== "none" &&
-      (!f.vcodec || f.vcodec === "none") &&
-      (f.ext === "m4a" || f.ext === "webm" || f.ext === "mp3" || f.ext === "opus")
-    )
-    .sort((a, b) => (b.abr || 0) - (a.abr || 0));
-
-  let audioCount = 0;
-  for (const f of audioFmts) {
-    if (audioCount >= 3) break; // عرض أفضل 3 جودات صوت فقط
-    const ext = f.ext || "audio";
-    const abr = f.abr ? `${Math.round(f.abr)}kbps` : null;
-    const key = `audio-${ext}-${abr}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      formats.push({
-        id:       f.format_id || "bestaudio",
-        type:     "audio",
-        label:    `Audio ${ext.toUpperCase()}${abr ? ` ${abr}` : ""}`,
-        quality:  abr,
-        ext,
-        filesize: f.filesize || f.filesize_approx || null,
-        url:      null,
-      });
-      audioCount++;
-    }
-  }
-
-  // ── الصور المصغرة/الكوفر (لـ تيك توك وإنستجرام) ──────────────────────────
-  if (
-    (platform === "tiktok" || platform === "instagram") &&
-    info.thumbnails && info.thumbnails.length > 0
-  ) {
-    formats.push({
-      id:       "thumbnail",
-      type:     "image",
-      label:    "Cover Image",
-      quality:  null,
-      ext:      "jpg",
-      filesize: null,
-      url:      info.thumbnails[info.thumbnails.length - 1]?.url || null, // يمكن تحميل الصورة مباشرة
-    });
-  }
-
-  return formats.slice(0, 12);
+  return [...videoPresets, ...tiktokExtra, ...audioPresets];
 }
 
-// تخصيص رسائل الخطأ للمستخدم
-function mapError(message) {
-  if (message.includes("Unsupported URL") || message.includes("Unable to extract"))
-    return "هذا الرابط غير مدعوم. يرجى التأكد من استخدام رابط يوتيوب، تيك توك، أو إنستجرام صحيح.";
-  if (message.includes("Private video") || message.includes("unavailable") || message.includes("removed"))
-    return "هذا المحتوى خاص (Private) أو غير متاح.";
-  if (message.includes("Sign in") || message.includes("age"))
-    return "هذا المحتوى مقيد بعمر أو يتطلب تسجيل الدخول ولا يمكن تحميله.";
-  return "لم نتمكن من جلب بيانات المحتوى. الرابط قد يكون غير صحيح أو المحتوى محذوف.";
+/**
+ * يُرجع خيارات Cobalt من format_id
+ */
+function resolveFormatOpts(formatId) {
+  const map = {
+    video_max:   { downloadMode: "auto",  videoQuality: "max"  },
+    video_1080:  { downloadMode: "auto",  videoQuality: "1080" },
+    video_720:   { downloadMode: "auto",  videoQuality: "720"  },
+    video_480:   { downloadMode: "auto",  videoQuality: "480"  },
+    video_360:   { downloadMode: "auto",  videoQuality: "360"  },
+    video_nowm:  { downloadMode: "auto",  videoQuality: "max"  },
+    audio_best:  { downloadMode: "audio", audioFormat:  "best" },
+    audio_mp3:   { downloadMode: "audio", audioFormat:  "mp3"  },
+    audio_opus:  { downloadMode: "audio", audioFormat:  "opus" },
+    audio_wav:   { downloadMode: "audio", audioFormat:  "wav"  },
+  };
+  return map[formatId] || { downloadMode: "auto", videoQuality: "max" };
+}
+
+function mapCobaltError(code) {
+  const errors = {
+    "error.api.link.unsupported":    "هذا الرابط غير مدعوم من Cobalt.",
+    "error.api.link.invalid":        "الرابط غير صحيح أو تالف.",
+    "error.api.content.unavailable": "المحتوى غير متاح أو محذوف.",
+    "error.api.fetch.short":         "تعذّر استخراج الرابط القصير.",
+    "error.api.content.age":         "المحتوى مقيد بعمر ولا يمكن تحميله.",
+    "error.api.content.private":     "المحتوى خاص (Private).",
+    "error.api.youtube.codec":       "صيغة الفيديو المطلوبة غير متوفرة على يوتيوب.",
+    "error.api.rate_exceeded":       "تم تجاوز حد الطلبات. حاول بعد قليل.",
+  };
+  return errors[code] || `خطأ من Cobalt: ${code}`;
 }
 
 // ── المسارات (Routes) ────────────────────────────────────────────────────────
 
-// 1. مسار جلب معلومات الفيديو والصيغ المتاحة
+/**
+ * 1. جلب معلومات الوسائط والصيغ المتاحة
+ *    لا يستدعي Cobalt هنا — يرجع presets ثابتة لتسريع الاستجابة
+ *    ويتحقق من صحة الرابط فقط
+ */
 app.post("/api/media/info", async (req, res) => {
   const { url } = req.body || {};
 
-  if (!url || typeof url !== "string" || !url.trim()) {
+  if (!url || typeof url !== "string" || !url.trim())
     return res.status(400).json({ error: "الرابط مطلوب" });
-  }
+
   const trimmed = url.trim();
-  if (!isValidUrl(trimmed)) {
+  if (!isValidUrl(trimmed))
     return res.status(400).json({ error: "صيغة الرابط غير صحيحة." });
-  }
 
   const platform = detectPlatform(trimmed);
 
+  // اختبار سريع أن Cobalt يقبل الرابط قبل إرجاع النتيجة
   try {
     console.log(`[info] ${platform} — ${trimmed}`);
-    // جلب البيانات الأساسية من الأداة
-    const info = await ytDlp(trimmed, { dumpJson: true, noPlaylist: true });
-    
-    // بناء الصيغ بناءً على نوع المنصة
-    const formats = buildFormats(info, platform);
+
+    const probe = await callCobalt(trimmed, {
+      downloadMode: "auto",
+      videoQuality: "720",
+    });
+
+    // إذا رجع خطأ من Cobalt نُعيده مباشرة
+    if (probe.status === "error") {
+      const msg = probe.error?.code
+        ? mapCobaltError(probe.error.code)
+        : "الرابط غير مدعوم أو المحتوى غير متاح.";
+      return res.status(422).json({ error: msg });
+    }
+
+    // استخراج عنوان من picker إن وُجد (اختياري)
+    let title = null;
+    if (probe.status === "picker" && probe.picker?.[0]) {
+      // Cobalt لا يرجع عنواناً مباشرة — نستخدم اسم المنصة كبديل
+    }
 
     res.json({
-      title:     info.title    || "بدون عنوان",
+      title:     title || `${platform.charAt(0).toUpperCase() + platform.slice(1)} Video`,
       platform,
-      thumbnail: info.thumbnail || null,
-      duration:  info.duration  || null,
-      author:    info.uploader || info.channel || null,
-      formats,
+      thumbnail: null,        // Cobalt لا يرجع thumbnail في مرحلة الـ probe
+      duration:  null,
+      author:    null,
+      formats:   buildPresets(platform),
     });
+
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`[info error] ${msg}`);
-    res.status(422).json({ error: mapError(msg) });
+    res.status(422).json({ error: "تعذّر التواصل مع Cobalt. تأكد من الرابط أو حاول مجدداً." });
   }
 });
 
-// 2. مسار تحميل الفيديو/الصوت وتمريره للمستخدم مباشرة
+/**
+ * 2. تحميل الملف وتمريره للمستخدم
+ *    يستدعي Cobalt بالمعاملات الصحيحة ثم يُعيد التوجيه أو يُمرّر stream
+ */
 app.get("/api/media/download", async (req, res) => {
   const { url, format_id } = req.query;
 
@@ -200,49 +204,92 @@ app.get("/api/media/download", async (req, res) => {
   if (!isValidUrl(url.trim()))
     return res.status(400).json({ error: "Invalid URL" });
 
+  const cobaltOpts = resolveFormatOpts(format_id);
+
   try {
-    console.log(`[download] format=${format_id} — ${url.trim()}`);
+    console.log(`[download] format=${format_id} opts=${JSON.stringify(cobaltOpts)} — ${url.trim()}`);
 
-    // استخراج اسم الملف وامتداده
-    const info = await ytDlp(url.trim(), { dumpJson: true, noPlaylist: true });
-    const fmt  = info.formats?.find(f => f.format_id === format_id);
-    const ext  = fmt?.ext || "mp4";
-    
-    // تنظيف اسم الملف من الرموز الممنوعة
-    const safeTitle = (info.title || "download")
-      .replace(/[^\w\s\u0600-\u06FF-]/g, "")
-      .trim()
-      .replace(/\s+/g, "_")
-      .slice(0, 80);
-    const filename = `${safeTitle}.${ext}`;
+    const result = await callCobalt(url.trim(), cobaltOpts);
 
-    // إعدادات ترويسة التحميل
-    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
-    res.setHeader("Content-Type", "application/octet-stream");
+    if (result.status === "error") {
+      const msg = result.error?.code
+        ? mapCobaltError(result.error.code)
+        : "فشل التحميل من Cobalt.";
+      return res.status(422).json({ error: msg });
+    }
 
-    // تشغيل التحميل وتمرير البيانات (Streaming) للمتصفح مباشرة
-    const sub = ytDlp.exec(
-      url.trim(),
-      { format: format_id, noPlaylist: true, output: "-" },
-      { stdio: ["ignore", "pipe", "pipe"] }
-    );
+    // ── حالة tunnel أو redirect: رابط مباشر واحد ──
+    if (result.status === "tunnel" || result.status === "redirect") {
+      const fileUrl = result.url;
 
-    // إنهاء العملية إذا أغلق المستخدم الصفحة
-    req.on("close", () => sub.kill());
-    
-    if (sub.stdout) sub.stdout.pipe(res);
-    if (sub.stderr) sub.stderr.on("data", d => console.debug("[yt-dlp]", d.toString().trim()));
+      // نُمرّر Stream عبر السيرفر لتفادي مشاكل CORS في المتصفح
+      const protocol = fileUrl.startsWith("https") ? https : http;
+      const proxyReq = protocol.get(fileUrl, proxyRes => {
+        // نُمرّر الترويسات كما هي
+        const contentDisposition = proxyRes.headers["content-disposition"]
+          || `attachment; filename="ripple_download"`;
+        const contentType = proxyRes.headers["content-type"]
+          || "application/octet-stream";
+
+        res.setHeader("Content-Disposition", contentDisposition);
+        res.setHeader("Content-Type",        contentType);
+        if (proxyRes.headers["content-length"])
+          res.setHeader("Content-Length", proxyRes.headers["content-length"]);
+
+        proxyRes.pipe(res);
+      });
+
+      proxyReq.on("error", err => {
+        console.warn("[proxy error]", err.message);
+        if (!res.headersSent)
+          res.status(500).json({ error: "فشل تمرير الملف من Cobalt." });
+      });
+
+      req.on("close", () => proxyReq.destroy());
+      return;
+    }
+
+    // ── حالة picker: مجموعة ملفات (مثلاً تيك توك بالعلامة المائية وبدونها) ──
+    if (result.status === "picker") {
+      // نختار أول ملف فيديو متاح
+      const item = result.picker?.find(p => p.type === "video") || result.picker?.[0];
+      if (!item?.url)
+        return res.status(422).json({ error: "لم يتوفر رابط تحميل في نتيجة Cobalt." });
+
+      const protocol = item.url.startsWith("https") ? https : http;
+      const proxyReq = protocol.get(item.url, proxyRes => {
+        res.setHeader("Content-Disposition", 'attachment; filename="ripple_download.mp4"');
+        res.setHeader("Content-Type", proxyRes.headers["content-type"] || "application/octet-stream");
+        if (proxyRes.headers["content-length"])
+          res.setHeader("Content-Length", proxyRes.headers["content-length"]);
+        proxyRes.pipe(res);
+      });
+
+      proxyReq.on("error", err => {
+        console.warn("[proxy error]", err.message);
+        if (!res.headersSent)
+          res.status(500).json({ error: "فشل تمرير الملف." });
+      });
+
+      req.on("close", () => proxyReq.destroy());
+      return;
+    }
+
+    // حالة غير متوقعة
+    res.status(422).json({ error: `استجابة غير معروفة من Cobalt: ${result.status}` });
 
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`[download error] ${msg}`);
-    if (!res.headersSent) res.status(422).json({ error: "فشل التحميل. قد يكون المحتوى غير متاح أو هناك مشكلة في السيرفر." });
+    if (!res.headersSent)
+      res.status(422).json({ error: "فشل التحميل. قد يكون المحتوى غير متاح أو هناك مشكلة في السيرفر." });
   }
 });
 
-// ── بدء التشغيل ─────────────────────────────────────────────────────────────
+// ── بدء التشغيل ──────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
   console.log(`\n  Ripple API running at http://localhost:${PORT}`);
-  console.log(`  Open  http://localhost:${PORT}/ripple.html  in your browser\n`);
+  console.log(`  Cobalt instance : ${COBALT_API}`);
+  console.log(`  Open http://localhost:${PORT}/index.html in your browser\n`);
 });
